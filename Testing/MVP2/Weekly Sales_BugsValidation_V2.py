@@ -1,0 +1,281 @@
+# Databricks notebook source
+# MAGIC %fs ls /mnt/data/manonmani.varadharajan@kroger.com/weekly_sales/
+
+# COMMAND ----------
+
+# MAGIC %fs ls /mnt/data/manonmani.varadharajan@kroger.com/daily_sales/landing_archive/
+
+# COMMAND ----------
+
+dfg= spark.read.csv("/mnt/data/manonmani.varadharajan@kroger.com/weekly_sales/101_Weekly_Sales.016.20240107190102_v2.csv",header=True)
+dfg.createOrReplaceTempView("gld_vw")
+
+# COMMAND ----------
+
+# MAGIC %sql select * from gld_vw
+
+# COMMAND ----------
+
+import fnmatch
+from pyspark.sql import DataFrame
+from pyspark.sql.types import StructType, StructField, StringType
+import pyspark.sql.functions as F
+from pyspark.sql.functions import col
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+
+spark_session = SparkSession.builder.appName('spark_Session').getOrCreate()
+emp_RDD = spark_session.sparkContext.emptyRDD()
+
+columns = StructType([
+    StructField('UPC_TYPE', StringType(), nullable=True),
+    StructField('DIV', StringType(), nullable=True),
+    StructField('STORE', StringType(), nullable=True),
+    StructField('ITEM_CONSUMER_UPC', StringType(), nullable=True),
+    StructField('POS_DATE', StringType(), nullable=True),
+    StructField('POS_NET_DOL_AMOUNT', StringType(), nullable=True),
+    StructField('POS_UOM_QTY', StringType(), nullable=True),
+    StructField('POS_UNITS', StringType(), nullable=True),
+    StructField('POS_UOM', StringType(), nullable=True),
+    StructField('ITEM_SRC_DIV', StringType(), nullable=True),
+    StructField('ITEM_SRC_LOC', StringType(), nullable=True),
+    StructField('MODALITY', StringType(), nullable=True),
+    StructField('FULFILLMENT', StringType(), nullable=True),
+    StructField('POS_GROSS_DOL_AMOUNT', StringType(), nullable=True),
+    StructField('STORE_COUPON_AMOUNT', StringType(), nullable=True),
+    StructField('MANUFACTURER_COUPON_AMOUNT', StringType(), nullable=True),
+    StructField('index', StringType(), nullable=True)
+])
+
+dsdf= spark_session.createDataFrame(data=emp_RDD,schema=columns)
+
+# COMMAND ----------
+
+from datetime import datetime
+from pyspark.sql.functions import lit
+from functools import reduce
+from pyspark.sql import DataFrame
+spark.conf.set("spark.sql.legacy.timeParserPolicy","LEGACY")
+rawFolderpath="/mnt/data/manonmani.varadharajan@kroger.com/daily_sales/landing_archive/"
+
+fileListSchema = ['path','name','size']
+rawFileList = dbutils.fs.ls(rawFolderpath)
+rawList = spark.createDataFrame(data=rawFileList, schema = fileListSchema)
+rawList.createOrReplaceTempView("vw_rawFileList")
+sfile1=spark.sql("select path,name from vw_rawFileList where name like '101_Daily_Sales.016.%'")
+sfileCollect=sfile1.collect()
+for row in sfileCollect:
+    sfiledc= str(row["name"])
+    spathdc= str(row["path"])
+    #print(sfiledc)
+    dt = sfiledc[20:28]
+    #print(dt)
+    cdt=datetime.strptime(dt,'%Y%m%d')
+    idx = (cdt.weekday() + 1) % 7 # MON = 0, SUN = 6 -> SUN = 0 .. SAT = 6
+    #print(idx)
+    sfilepath1=str(spathdc)
+    #print("DSA Raw file: " +sfilepath1)
+    dfs= spark.read.option("header","true").csv(sfilepath1)
+    dfsi = dfs.withColumn("index",lit(idx))
+    dsdf = dsdf.union(dfsi)
+#dsdf.display()
+dsdf.createOrReplaceTempView('vw_union')
+restatesql="select * from (select UPC_TYPE,DIV,STORE,ITEM_CONSUMER_UPC,POS_DATE,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV,ITEM_SRC_LOC,MODALITY,FULFILLMENT,index, row_number() over(partition by DIV,STORE,ITEM_CONSUMER_UPC,POS_DATE,ITEM_SRC_DIV,ITEM_SRC_LOC,MODALITY,FULFILLMENT order by index desc) as rn from vw_union) where rn=1 and weekofyear(to_date(POS_DATE,'MM/dd/yyyy')+1)=weekofyear('2024-01-05')"
+restatedf=spark.sql(restatesql)
+restatedf.createOrReplaceTempView('vw_restate')
+restatesql2="select UPC_TYPE,DIV,STORE,ITEM_CONSUMER_UPC,case when index=0 then to_date(POS_DATE,'MM/dd/yyyy') else to_date(date_sub(next_day(to_date(POS_DATE,'MM/dd/yyyy'),'SAT'),0),'MM/dd/yyyy') end as POS_DATE,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV, ITEM_SRC_LOC from vw_restate"
+restatedf2=spark.sql(restatesql2)
+restatedf2.createOrReplaceTempView('vw_restate2')
+bronzSql="select * from vw_restate2 where DIV is not null and STORE is not null and ITEM_CONSUMER_UPC is not null and POS_DATE is not null and POS_NET_DOL_AMOUNT is not null and POS_UOM_QTY is not null and POS_UNITS is not null " 
+silverDf=spark.sql(bronzSql)
+i_df = silverDf.filter("UPC_TYPE='I'")
+c_df =  silverDf.filter("UPC_TYPE='C'").join(i_df,["DIV","STORE","ITEM_CONSUMER_UPC"],"left_anti")
+combined_df = i_df.unionByName(c_df)
+combined_df.createOrReplaceTempView('vwSilverData')
+rollupSql="SELECT  DIV,STORE, ITEM_CONSUMER_UPC, max(POS_DATE) as POS_DATE,SUM(POS_NET_DOL_AMOUNT) AS POS_NET_DOL_AMOUNT, SUM(POS_UOM_QTY) AS POS_UOM_QTY, SUM(POS_UNITS) AS POS_UNITS, MAX(POS_UOM) AS POS_UOM,ITEM_SRC_DIV from vwSilverData GROUP BY  DIV,STORE, ITEM_CONSUMER_UPC,ITEM_SRC_DIV"
+weeklydf = spark.sql(rollupSql)
+#display(weeklydf)
+weeklydf.createOrReplaceTempView('src_vw')
+gldFolderpath="/mnt/data/manonmani.varadharajan@kroger.com/daily_sales/landing_archive/"
+
+# COMMAND ----------
+
+# MAGIC %sql select * from vw_union where ITEM_CONSUMER_UPC='0010000010017' and DIV='016' and STORE='00522'
+
+# COMMAND ----------
+
+# MAGIC %sql select * from vw_rawFileList where name like '101_Daily_Sales.016.%'
+
+# COMMAND ----------
+
+from pyspark.sql import SparkSession
+from pyspark.sql.types import *
+spark_session = SparkSession.builder.appName('spark_Session').getOrCreate()
+emp_RDD = spark_session.sparkContext.emptyRDD()
+columns = StructType([
+                      StructField('TestCaseSummary',StringType(),False),
+                      StructField('TestCaseDescription',StringType(),False),
+                      StructField('Status', StringType(), False),
+                      StructField('Comments', StringType(), False),
+                      StructField('Test_Data', StringType(), False)
+                      ])
+testResult = spark_session.createDataFrame(data=emp_RDD,schema=columns)
+
+# COMMAND ----------
+
+# MAGIC %sql select * from gld_vw
+
+# COMMAND ----------
+
+# MAGIC %sql select * from src_vw
+
+# COMMAND ----------
+
+# MAGIC %sql select distinct pos_date from src_vw
+
+# COMMAND ----------
+
+# MAGIC %sql select distinct pos_date from gld_vw
+
+# COMMAND ----------
+
+# MAGIC %md #Count Validation
+
+# COMMAND ----------
+
+dfsrccnt=spark.sql("select count(1) from src_vw minus select count(1) from gld_vw union all select count(1) from gld_vw minus select count(1) from src_vw")
+dfsrccountunion=spark.sql("select 'src' as tabnm, count(1) from src_vw union all select 'gld' as tabnm, count(1) from gld_vw")
+dfrowcount=dfsrccnt.count()
+testResult=[]
+if dfrowcount<1:
+    testResult.append(('Count comparison vs target', 'Count comparison rolled_up raw file vs ETL Ready file', 'pass', 'Record count is matching', 'count check'))
+else:
+    testResult.append(('Count comparison vs target', 'Count comparison raw file vs ETL Ready file', 'fail', 'Record count is not matching, please check dfsrccountunion', 'count check'))
+display(dfsrccountunion)   
+
+# COMMAND ----------
+
+# MAGIC %md #Aggregate Validation
+
+# COMMAND ----------
+
+dfaggdiff=spark.sql("select  cast(sum(POS_NET_DOL_AMOUNT) as decimal(38,4)),cast(sum(POS_UOM_QTY) as decimal(18,4)), sum(POS_UNITS) from src_vw minus select cast(sum(POS_NET_DOL_AMOUNT) as decimal(38,4)),cast(sum(POS_UOM_QTY) as decimal(18,4)), sum(POS_UNITS) from gld_vw")
+dfsaggunion=spark.sql("select 'src' as tabnm, cast(sum(POS_NET_DOL_AMOUNT) as decimal(38,4)),cast(sum(POS_UOM_QTY) as decimal(18,4)), sum(POS_UNITS) from src_vw union all select 'gld' as tabnm, cast(sum(POS_NET_DOL_AMOUNT) as decimal(38,4)),cast(sum(POS_UOM_QTY) as decimal(18,4)), sum(POS_UNITS) from gld_vw")
+dfaggcount=dfaggdiff.count()
+if dfaggcount<1:
+    testResult.append(('Aggregate validation', 'Aggregate validation rolled up raw file vs ETL Ready file', 'pass', 'Sum of Amount and unit values are matching', 'aggregate validation'))
+else:
+    testResult.append(('Aggregate validation', 'Aggregate validation rolled up raw file vs ETL Ready file', 'fail', 'Sum of Amount and unit values are not matching please refer to dfsaggunion', 'aggregate validation'))
+display(dfsaggunion)  
+
+# COMMAND ----------
+
+# MAGIC %sql select min(tabnm) as tabnm,POS_NET_DOL_AMOUNT,store from 
+# MAGIC (select 'src' as tabnm, cast(sum(POS_NET_DOL_AMOUNT) as decimal(36,4)) as POS_NET_DOL_AMOUNT, store from src_vw group by store
+# MAGIC union all select 'gld' as tabnm, cast(sum(POS_NET_DOL_AMOUNT) as decimal(36,4)) as POS_NET_DOL_AMOUNT,store from gld_vw  group by store)
+# MAGIC group by POS_NET_DOL_AMOUNT,store 
+# MAGIC having count(*)!=2
+# MAGIC order by store
+
+# COMMAND ----------
+
+# MAGIC %sql 
+# MAGIC
+# MAGIC select min(tabnm) as tabnm, DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV,count(*)
+# MAGIC from
+# MAGIC (select 'raw' as tabnm,DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal(36,2)),cast(POS_UOM_QTY  as decimal(36,2)),POS_UNITS,POS_UOM,ITEM_SRC_DIV from src_vw where store='00881'
+# MAGIC union all 
+# MAGIC select 'gld' as tabnm,DIV ,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal(36,2)),cast(POS_UOM_QTY  as decimal(36,2)),POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw where store='00881') group by DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV
+# MAGIC having count(*)<>2
+# MAGIC order by ITEM_CONSUMER_UPC
+
+# COMMAND ----------
+
+# MAGIC %sql 
+# MAGIC
+# MAGIC select min(tabnm) as tabnm, DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV,count(*)
+# MAGIC from
+# MAGIC (select 'raw' as tabnm,DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal(36,2)),cast(POS_UOM_QTY  as decimal(36,2)),POS_UNITS,POS_UOM,ITEM_SRC_DIV from src_vw where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+# MAGIC union all 
+# MAGIC select 'gld' as tabnm,DIV ,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal(36,2)),cast(POS_UOM_QTY  as decimal(36,2)),POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw where store='00881' and ITEM_CONSUMER_UPC='0001111020639') group by DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV
+# MAGIC having count(*)<>2
+# MAGIC order by ITEM_CONSUMER_UPC
+
+# COMMAND ----------
+
+# MAGIC %sql select * from src_vw where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+
+# COMMAND ----------
+
+# MAGIC %sql select * from vwSilverData where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+
+# COMMAND ----------
+
+# MAGIC %sql select * from vw_restate2 where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+
+# COMMAND ----------
+
+# MAGIC %sql select * from vw_union where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+
+# COMMAND ----------
+
+# MAGIC %sql select * from gld_vw where store='00881' and ITEM_CONSUMER_UPC='0001111020639'
+
+# COMMAND ----------
+
+# MAGIC %md #Minus query
+
+# COMMAND ----------
+
+dfsminust=spark.sql("select DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (38,3)),cast(POS_UOM_QTY as decimal (4,2)),cast(POS_UNITS as decimal),POS_UOM,ITEM_SRC_DIV from src_vw minus select lpad(DIV,3,'0') as DIV,lpad(STORE,5,'0') as STORE,lpad(ITEM_CONSUMER_UPC,13,'0') as ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (38,3)) as POS_NET_DOL_AMOUNT,cast(POS_UOM_QTY as decimal (4,2)) as POS_UOM_QTY,cast(POS_UNITS as decimal) as POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw")
+dftminuss=spark.sql("select lpad(DIV,3,'0') as DIV,lpad(STORE,5,'0') as STORE,lpad(ITEM_CONSUMER_UPC,13,'0') as ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (38,3)) as POS_NET_DOL_AMOUNT,cast(POS_UOM_QTY as decimal (4,2)) as POS_UOM_QTY,cast(POS_UNITS as decimal) as POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw minus select DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (38,3)),cast(POS_UOM_QTY as decimal (4,2)),cast(POS_UNITS as decimal),POS_UOM,ITEM_SRC_DIV from src_vw")
+dfminusunion=dfsminust.union(dftminuss)
+dfminuscount=dfminusunion.count()
+if dfminuscount<1:
+    testResult.append(('Column level data validation', 'Minus query rolled-up raw file vs ETL Ready file', 'pass', 'Data matches raw file vs ETL Ready file', 'full validation check'))
+else:
+    testResult.append(('Column level data validation', 'Minus query rolled-up raw file vs ETL Ready file', 'fail', 'Data does not match, please check dfminusunion', 'full validation check'))
+display(dfsminust)
+
+# COMMAND ----------
+
+# MAGIC %sql select min(tabnm) as tabnm, DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV,count(*)
+# MAGIC from
+# MAGIC (
+# MAGIC select 'raw' as tabnm,DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (8,3)) as POS_NET_DOL_AMOUNT,cast(POS_UOM_QTY as decimal (4,2))  as POS_UOM_QTY,cast(POS_UNITS as decimal) as POS_UNITS,POS_UOM,ITEM_SRC_DIV from src_vw where ITEM_CONSUMER_UPC='0010000027813'and store='00348'
+# MAGIC union all 
+# MAGIC select 'gld' as tabnm,lpad(DIV,3,'0') as DIV,lpad(STORE,5,'0') as STORE,lpad(ITEM_CONSUMER_UPC,13,'0') as ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (8,3)) as POS_NET_DOL_AMOUNT,cast(POS_UOM_QTY as decimal (4,2)) as POS_UOM_QTY,cast(POS_UNITS as decimal) as POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw where lpad(ITEM_CONSUMER_UPC,13,'0')='0010000027813'and store='00348'
+# MAGIC ) group by DIV,STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV
+# MAGIC --having count(*)<>2
+# MAGIC order by STORE,ITEM_CONSUMER_UPC,POS_NET_DOL_AMOUNT
+
+# COMMAND ----------
+
+# MAGIC %sql select 'raw' as tabnm,DIV,STORE,ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (8,3)),cast(POS_UOM_QTY as decimal (4,2)),cast(POS_UNITS as decimal),POS_UOM,ITEM_SRC_DIV from src_vw where ITEM_CONSUMER_UPC='0010000027813' and STORE='00328'
+# MAGIC union all 
+# MAGIC select 'gld' as tabnm,lpad(DIV,3,'0') as DIV,lpad(STORE,5,'0') as STORE,lpad(ITEM_CONSUMER_UPC,13,'0') as ITEM_CONSUMER_UPC,cast(POS_NET_DOL_AMOUNT as decimal (8,3)) as POS_NET_DOL_AMOUNT,cast(POS_UOM_QTY as decimal (4,2)) as POS_UOM_QTY,cast(POS_UNITS as decimal) as POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw where lpad(ITEM_CONSUMER_UPC,13,'0')='0010000027813' and lpad(STORE,5,'0')='00328'
+# MAGIC order by STORE,ITEM_CONSUMER_UPC
+
+# COMMAND ----------
+
+# MAGIC %md #Duplicate check on Gold data
+
+# COMMAND ----------
+
+dfdup=spark.sql("select DIV,STORE,ITEM_CONSUMER_UPC,POS_DATE,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV from gld_vw group by DIV,STORE,ITEM_CONSUMER_UPC,POS_DATE,POS_NET_DOL_AMOUNT,POS_UOM_QTY,POS_UNITS,POS_UOM,ITEM_SRC_DIV having count(1)>2")
+dfdupcount=dfdup.count()
+if dfdupcount<1:
+    testResult.append(('Duplicate check', 'Check for dupliacte records', 'pass', 'No duplicate records', 'duplicate check'))
+else:
+    testResult.append(('Duplicate check', 'Check for dupliacte records', 'fail', 'Duplicate records are found check dfdup', 'duplicate check'))
+    
+
+# COMMAND ----------
+
+# MAGIC %md #Result Dashboard
+
+# COMMAND ----------
+
+dfResult = spark_session.createDataFrame (data=testResult, schema=columns)
+dfResult.createOrReplaceTempView("testResult_vw")
+dfResult.display()
