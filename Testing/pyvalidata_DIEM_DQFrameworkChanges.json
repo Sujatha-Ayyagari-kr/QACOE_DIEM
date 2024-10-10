@@ -1,0 +1,22 @@
+{
+    "testcase1": {
+        "summary": "DLT pipeline validation/Bronze Quarantine",
+        "description": "Execute DLT pipeline",
+        "status": "pass",
+        "priority": "high",
+        "assignee": "kon7198",
+        "test_data": "DLT_Pipeline_Validation",
+        "expected_result": "Records that fail the DQ check are pushed to Bronze quarantine",
+        "jira": "DEART-30039"
+    },
+    "testcase2": {
+        "summary": "GX package for DQ rules/ silver Quarantine",
+        "description": "1. In config DATA QUALITY CSV GX.csv activate additional rules to test silver quarantine. 2. Add the GX function to the data_quality.py. 3. Run the Weekly job with test data",
+        "status": "pass",
+        "priority": "high",
+        "assignee": "kon7198",
+        "test_data": "GX_Package_ForDQRules",
+        "expected_result": "The result data set in silver quarantine is as expected ",
+        "jira": "DEART-30039"
+    }
+}
